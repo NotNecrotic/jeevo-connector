@@ -1,0 +1,87 @@
+# Tag vX.Y.Z on master -> stable; vX.Y.Z-rc.N -> beta (pre-release).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build, Sign and Publish
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Release Metadata
+        id: meta
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $tag is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE"; exit 1
+          fi
+          if [[ "$version" == *-* ]]; then channel=beta; else channel=stable; fi
+          if [[ "$channel" == stable ]]; then
+            git fetch -q origin master
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/master \
+              || { echo "::error::Stable releases must be tagged on a commit that is on master"; exit 1; }
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "channel=$channel" >>"$GITHUB_OUTPUT"
+          echo "Releasing $version on the $channel channel"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup Release Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -r ai/requirements-dev.txt
+
+      - name: Build and Sign
+        env:
+          JEEVO_RELEASE_KEY: ${{ secrets.JEEVO_RELEASE_KEY }}
+        run: |
+          [[ -n "$JEEVO_RELEASE_KEY" ]] || { echo "::error::The JEEVO_RELEASE_KEY secret is not set"; exit 1; }
+          ./scripts/release.sh "${{ steps.meta.outputs.version }}" "${{ steps.meta.outputs.channel }}" dist
+
+      - name: Verify Release Signature
+        env:
+          PUBKEY: ${{ vars.JEEVO_RELEASE_PUBLIC_KEY }}
+        run: |
+          [[ -n "$PUBKEY" ]] || { echo "::error::Set the JEEVO_RELEASE_PUBLIC_KEY repository variable"; exit 1; }
+          d="dist/${{ steps.meta.outputs.version }}"
+          go run ./cmd/jeevo-release verify --pub "$PUBKEY" --manifest "$d/manifest.json" --sig "$d/manifest.json.sig"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.meta.outputs.version }}"
+          d="dist/$v"
+          cp protocol/openapi.yaml "$d/"
+          flags=(--title "v$v" --generate-notes --verify-tag)
+          [[ "${{ steps.meta.outputs.channel }}" == beta ]] && flags+=(--prerelease) || flags+=(--latest)
+          gh release create "$GITHUB_REF_NAME" "${flags[@]}" "$d"/*

@@ -1,0 +1,11 @@
+# Python lint for the AI worker. Run locally with: ruff check ai && ruff format --check ai
+target-version = "py310"
+line-length = 110
+include = ["ai/**/*.py"]
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]  # line length is the formatter's job
+
+[lint.isort]
+known-first-party = ["ai"]

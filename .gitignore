@@ -1,0 +1,14 @@
+# Build output
+/dist/
+/jeevo-connector
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+# Models
+*.onnx
+# Other
+.claude/

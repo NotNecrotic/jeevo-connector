@@ -1,2 +1,28 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# LF everywhere: a CRLF shell script breaks on Linux (bad interpreter).
+* text=auto eol=lf
+
+# Shell scripts must never gain a carriage return.
+*.sh text eol=lf
+
+# PowerShell is fine either way, but LF is consistent with everything else.
+*.ps1 text eol=lf
+
+# Windows-native files keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1.txt text eol=crlf
+
+# Binary files must never be line-ending converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.mp4 binary
+*.webm binary
+*.onnx binary
+*.exe binary
+*.sqlite binary
+*.sqlite3 binary

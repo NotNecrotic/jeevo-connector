@@ -1,0 +1,954 @@
+openapi: 3.0.3
+info:
+  title: Jeevo Connector Protocol
+  version: "1"
+  description: |
+    The single source of truth for everything that passes between a Jeevo
+    connector and the Jeevo server, and between a connector and the outside
+    world.
+
+    Two HTTP surfaces live here, told apart by tag:
+
+    - **jeevo-server**: endpoints the Jeevo server exposes for connectors
+      (discovery, enrolment, releases, the WebSocket upgrade).
+    - **connector-public**: what a connector serves on its HTTPS domain to
+      uploaders and viewers. Every route is token-gated and deliberately
+      featureless: no Server header, no version, generic errors.
+    The WebSocket protocol is described as schemas too. Every frame on the
+    control channel is a `WsMessage`. The `x-jeevo-ws-messages` extension at
+    the bottom maps each message `type` to its direction, payload schema and
+    reply schema, and the code generators turn that map into typed constants
+    for Go and TypeScript. Change this file, then regenerate the Go side with
+    `go generate ./internal/protocol`. The Jeevo server keeps a pinned copy of
+    this file and regenerates its side when it syncs to a release.
+
+    Bump `PROTOCOL_VERSION` (x-jeevo-protocol-version) for any change that an
+    older peer cannot ignore. Both sides refuse a peer whose protocol version
+    is outside the range they support.
+  x-jeevo-protocol-version: 1
+servers:
+  - url: https://jeevo.example.com
+    description: Jeevo server (tag jeevo-server)
+  - url: https://{connectorId}.media.example.com
+    description: A connector's public domain (tag connector-public)
+    variables:
+      connectorId:
+        default: k7p2xq9m
+tags:
+  - name: jeevo-server
+  - name: connector-public
+
+paths:
+  # ---------------------------------------------------------------- server ---
+  /.well-known/jeevo-connector.json:
+    get:
+      tags: [jeevo-server]
+      operationId: getDiscovery
+      summary: Discovery document. The only URL a connector is ever given.
+      description: |
+        The install script and the connector itself start from one URL (the
+        Jeevo server's public origin). Every other URL — API base, WebSocket,
+        release channel, install script — comes from this document, so they
+        can move without reinstalling connectors.
+      responses:
+        "200":
+          description: Discovery document
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Discovery" }
+
+  /api/connector/v1/enroll:
+    post:
+      tags: [jeevo-server]
+      operationId: enroll
+      summary: Exchange a one-time license key for connector credentials.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnrollRequest" }
+      responses:
+        "200":
+          description: Enrolled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EnrollResponse" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+
+  /api/connector/v1/ws:
+    get:
+      tags: [jeevo-server]
+      operationId: connectWebSocket
+      summary: Upgrade to the connector control channel (WebSocket).
+      description: |
+        Authenticated with `Authorization: Bearer <connectorId>.<connectorSecret>`.
+        Text frames carry `WsMessage` JSON. Binary frames carry proxied
+        HTTP bodies, framed as described in `ProxyBinaryFrame`.
+      parameters:
+        - in: header
+          name: Authorization
+          required: true
+          schema: { type: string }
+      responses:
+        "101": { description: "Switching protocols" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "426": { $ref: "#/components/responses/Error" }
+
+  /api/connector/v1/releases/{channel}:
+    get:
+      tags: [jeevo-server]
+      operationId: getRelease
+      summary: The current release on a channel, with its detached signature.
+      parameters:
+        - in: path
+          name: channel
+          required: true
+          schema: { $ref: "#/components/schemas/ReleaseChannel" }
+      responses:
+        "200":
+          description: Release
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReleaseEnvelope" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /api/connector/v1/releases/files/{version}/{file}:
+    get:
+      tags: [jeevo-server]
+      operationId: downloadReleaseFile
+      summary: Download one release artifact named in a manifest.
+      parameters:
+        - { in: path, name: version, required: true, schema: { type: string } }
+        - { in: path, name: file, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Artifact bytes
+          content:
+            application/gzip:
+              schema: { type: string, format: binary }
+        "404": { $ref: "#/components/responses/Error" }
+
+  # ---------------------------------------------------- connector public -----
+  /healthz:
+    get:
+      tags: [connector-public]
+      operationId: healthz
+      summary: Liveness. Empty 204, reveals nothing.
+      responses:
+        "204": { description: "Alive" }
+
+  /.well-known/jeevo-reach/{nonce}:
+    get:
+      tags: [connector-public]
+      operationId: reach
+      summary: Reachability probe used by Jeevo to choose direct vs proxy mode.
+      description: |
+        Answers 204 only for a nonce Jeevo announced over the WebSocket in the
+        last two minutes (`reach.prepare`). Anything else is a 404, so the
+        endpoint cannot be used to fingerprint a connector.
+      parameters:
+        - { in: path, name: nonce, required: true, schema: { type: string, pattern: "^[A-Za-z0-9_-]{16,64}$" } }
+      responses:
+        "204": { description: "Nonce recognised" }
+        "404": { description: "Unknown nonce" }
+
+  /v1/uploads/{uploadId}:
+    parameters:
+      - { in: path, name: uploadId, required: true, schema: { type: string, pattern: "^[A-Za-z0-9_-]{8,64}$" } }
+      - in: header
+        name: Authorization
+        required: true
+        description: "Bearer <upload token> issued by Jeevo for exactly this upload."
+        schema: { type: string }
+    head:
+      tags: [connector-public]
+      operationId: uploadOffset
+      summary: How many bytes of this upload the connector already holds (resume).
+      responses:
+        "204":
+          description: Current offset
+          headers:
+            Upload-Offset: { schema: { type: integer } }
+            Upload-Length: { schema: { type: integer } }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [connector-public]
+      operationId: uploadChunk
+      summary: Append one chunk at Upload-Offset. The last chunk completes the upload.
+      parameters:
+        - in: header
+          name: Upload-Offset
+          required: true
+          schema: { type: integer, minimum: 0 }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "204":
+          description: Chunk stored, more expected
+          headers:
+            Upload-Offset: { schema: { type: integer } }
+        "201":
+          description: Upload complete; processing has started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadComplete" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409":
+          description: Offset mismatch. Body and Upload-Offset carry the real offset.
+          headers:
+            Upload-Offset: { schema: { type: integer } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "413": { $ref: "#/components/responses/Error" }
+        "507": { $ref: "#/components/responses/Error" }
+
+  /v1/media/{mediaId}/thumbnail.jpg:
+    get:
+      tags: [connector-public]
+      operationId: mediaThumbnail
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - $ref: "#/components/parameters/PlaybackToken"
+      responses:
+        "200": { description: "JPEG, content: { image/jpeg: { schema: { type: string, format: binary } } }" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/media/{mediaId}/original:
+    get:
+      tags: [connector-public]
+      operationId: mediaOriginal
+      summary: The stored original. Served for photos and GIFs only.
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - $ref: "#/components/parameters/PlaybackToken"
+      responses:
+        "200": { description: "Bytes (Range supported)" }
+        "206": { description: "Partial content" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/media/{mediaId}/preview.mp4:
+    get:
+      tags: [connector-public]
+      operationId: mediaPreview
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - $ref: "#/components/parameters/PlaybackToken"
+      responses:
+        "200": { description: "MP4 (Range supported)" }
+        "206": { description: "Partial content" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/media/{mediaId}/hls/master.m3u8:
+    get:
+      tags: [connector-public]
+      operationId: mediaHlsMaster
+      summary: Multivariant playlist, filtered to the token's quality cap and rewritten to carry the token.
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - $ref: "#/components/parameters/PlaybackToken"
+      responses:
+        "200": { description: "Playlist, content: { application/vnd.apple.mpegurl: { schema: { type: string } } }" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/media/{mediaId}/hls/{variant}/{file}:
+    get:
+      tags: [connector-public]
+      operationId: mediaHlsFile
+      parameters:
+        - $ref: "#/components/parameters/MediaId"
+        - { in: path, name: variant, required: true, schema: { type: string, pattern: "^(p\\d{3,4}|audio)$" } }
+        - { in: path, name: file, required: true, schema: { type: string, pattern: "^(index\\.m3u8|init(_\\d{1,2})?\\.mp4|seg_\\d{5,6}\\.m4s)$" } }
+        - $ref: "#/components/parameters/PlaybackToken"
+      responses:
+        "200": { description: "Playlist or segment" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+
+components:
+  parameters:
+    MediaId:
+      in: path
+      name: mediaId
+      required: true
+      schema: { type: string, pattern: "^[A-Za-z0-9_-]{4,64}$" }
+    PlaybackToken:
+      in: query
+      name: t
+      required: true
+      description: A `PlaybackToken` signed by the Jeevo server.
+      schema: { type: string }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    Ok:
+      description: Ok
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [ok]
+            properties: { ok: { type: boolean } }
+
+  schemas:
+    # ------------------------------------------------------------ common ----
+    ErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+
+    ConnectorId:
+      type: string
+      description: Short lowercase base32 id; also the first label of the connector's domain.
+      pattern: "^[a-z2-7]{8}$"
+
+    Timestamp:
+      type: string
+      format: date-time
+
+    # --------------------------------------------------------- discovery ----
+    Discovery:
+      type: object
+      required: [protocolVersion, minProtocolVersion, apiBaseUrl, wsUrl, releasesUrl, installScriptUrl, releaseSigningKeys]
+      properties:
+        protocolVersion: { type: integer, description: "Highest protocol version the server speaks." }
+        minProtocolVersion: { type: integer, description: "Lowest protocol version the server still accepts." }
+        apiBaseUrl: { type: string, format: uri, description: "Base for /api/connector/v1/* (no trailing slash)." }
+        wsUrl: { type: string, format: uri, description: "wss:// URL of the control channel." }
+        releasesUrl: { type: string, format: uri, description: "Base for /releases/{channel} and /releases/files/... (no trailing slash)." }
+        installScriptUrl: { type: string, format: uri }
+        releaseSigningKeys:
+          type: array
+          description: Ed25519 public keys (base64, raw 32 bytes) that may sign release manifests. Pinned by the connector at install time.
+          items: { type: string }
+        latestVersion: { type: string, nullable: true, description: "Current version on the stable channel, if any." }
+
+    # ---------------------------------------------------------- enrolment ---
+    EnrollRequest:
+      type: object
+      required: [licenseKey, version, protocolVersion, os, arch, hostname]
+      properties:
+        licenseKey: { type: string, pattern: "^JVC(-[A-Z2-7]{4}){5}$" }
+        version: { type: string, maxLength: 64 }
+        protocolVersion: { type: integer }
+        os: { type: string, maxLength: 32 }
+        arch: { type: string, maxLength: 32 }
+        hostname: { type: string, maxLength: 255 }
+
+    EnrollResponse:
+      type: object
+      required: [connectorId, connectorSecret, name, domain, playbackPublicKey, wsUrl]
+      properties:
+        connectorId: { $ref: "#/components/schemas/ConnectorId" }
+        connectorSecret:
+          type: string
+          description: 64 hex chars. Shown once; the server keeps only its sha256.
+        name: { type: string }
+        domain: { type: string, description: "FQDN assigned to this connector, e.g. k7p2xq9m.media.example.com" }
+        playbackPublicKey: { type: string, description: "Ed25519 public key (base64 raw) that verifies PlaybackTokens." }
+        wsUrl: { type: string, format: uri }
+
+    # ---------------------------------------------------------- releases ----
+    ReleaseChannel:
+      type: string
+      enum: [stable, beta]
+
+    ReleaseArtifact:
+      type: object
+      required: [os, arch, file, sha256, size]
+      properties:
+        os: { type: string, enum: [linux] }
+        arch: { type: string, enum: [amd64, arm64] }
+        file: { type: string, description: "File name under /releases/files/{version}/." }
+        sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+        size: { type: integer }
+
+    ReleaseManifest:
+      type: object
+      required: [version, channel, publishedAt, protocolVersion, artifacts]
+      properties:
+        version: { type: string, description: "Semantic version, e.g. 1.2.0" }
+        channel: { $ref: "#/components/schemas/ReleaseChannel" }
+        publishedAt: { $ref: "#/components/schemas/Timestamp" }
+        protocolVersion: { type: integer }
+        notes: { type: string }
+        artifacts:
+          type: array
+          items: { $ref: "#/components/schemas/ReleaseArtifact" }
+        installScript:
+          $ref: "#/components/schemas/ReleaseInstallScript"
+
+    ReleaseInstallScript:
+      type: object
+      description: |
+        The release's install.sh, published next to the artifacts. Its hash is
+        signed with the manifest so the Jeevo server only serves an installer
+        that came from the same signed release.
+      required: [file, sha256, size]
+      properties:
+        file: { type: string, enum: [install.sh] }
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        size: { type: integer }
+
+    ReleaseEnvelope:
+      type: object
+      required: [manifest, signature]
+      properties:
+        manifest:
+          type: string
+          description: The manifest JSON exactly as signed. Parse it only after verifying the signature.
+        signature:
+          type: string
+          description: Base64 Ed25519 signature over the UTF-8 bytes of `manifest`.
+
+    # ---------------------------------------------------------- settings ----
+    ConnectorSettings:
+      type: object
+      description: |
+        Everything an owner can tune from Jeevo → Settings → Connectors. The
+        server validates and stores it; the connector receives it in
+        `hello.ack` and in `settings.apply`, and re-validates before applying.
+        Only the choices an owner genuinely needs are settings. Everything
+        else (bind address, chunk size, upload link lifetime, disk headroom,
+        encoder preset, segment length, scan threshold and sampling...) is a
+        fixed constant in the connector.
+      required: [network, uploads, processing, ai, updates, logging]
+      properties:
+        network: { $ref: "#/components/schemas/NetworkSettings" }
+        uploads: { $ref: "#/components/schemas/UploadSettings" }
+        processing: { $ref: "#/components/schemas/ProcessingSettings" }
+        ai: { $ref: "#/components/schemas/AiSettings" }
+        updates: { $ref: "#/components/schemas/UpdateSettings" }
+        logging: { $ref: "#/components/schemas/LoggingSettings" }
+
+    NetworkSettings:
+      type: object
+      required: [mode, listenPort, publicPort, publicAddress]
+      properties:
+        mode:
+          type: string
+          enum: [auto, direct, proxy]
+          description: auto = direct when reachable, else proxy. direct never falls back. proxy always relays through Jeevo.
+        listenPort:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: TCP port the connector listens on, on all interfaces (the bind address is always 0.0.0.0).
+        publicPort:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Port clients use (differs from listenPort behind port forwarding).
+        publicAddress:
+          type: string
+          maxLength: 45
+          description: |
+            Public IPv4/IPv6 for the connector's DNS record, set by hand; it
+            overrides the automatic address. Empty (the default) = automatic:
+            the address Jeevo sees the WebSocket coming from when that is
+            public, else the address the connector detects and reports. The
+            connector always detects and reports its address.
+
+    UploadSettings:
+      type: object
+      required: [maxUploadMb]
+      properties:
+        maxUploadMb: { type: integer, minimum: 1, maximum: 65536 }
+
+    ProcessingSettings:
+      type: object
+      description: Hover previews and sonic graphs are always produced.
+      required: [hlsEncoder, hlsQualities]
+      properties:
+        hlsEncoder:
+          type: string
+          enum: [auto, libx264, h264_nvenc, h264_qsv]
+          description: auto tries NVENC, then Quick Sync, with a test encode, and falls back to libx264.
+        hlsQualities:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: { type: integer, minimum: 144, maximum: 4320 }
+
+    AiSettings:
+      type: object
+      description: NSFW scanning is mandatory; this only picks where it runs.
+      required: [device]
+      properties:
+        device: { type: string, enum: [auto, cpu, cuda] }
+
+    UpdateSettings:
+      type: object
+      required: [channel, autoUpdate]
+      properties:
+        channel: { $ref: "#/components/schemas/ReleaseChannel" }
+        autoUpdate: { type: boolean }
+
+    LoggingSettings:
+      type: object
+      required: [level]
+      properties:
+        level: { type: string, enum: [debug, info, warn, error] }
+
+    # ----------------------------------------------------- playback tokens --
+    PlaybackTokenClaims:
+      type: object
+      description: |
+        Wire format: `v1.<base64url(JSON claims)>.<base64url(Ed25519 signature)>`,
+        the signature covering the ASCII bytes `v1.<base64url(JSON claims)>`.
+        Issued by Jeevo only for media the viewer may see; verified by the
+        connector with the key it received at enrolment. Carries no user
+        identity, so a connector never learns who is watching.
+      required: [c, m, e]
+      properties:
+        c: { $ref: "#/components/schemas/ConnectorId" }
+        m: { type: string, description: "Media id." }
+        e: { type: integer, description: "Expiry, unix seconds." }
+        q: { type: integer, description: "Maximum rendition short side (e.g. 720). Absent = no cap." }
+
+    # ------------------------------------------------------------ uploads ---
+    UploadComplete:
+      type: object
+      required: [status, mediaId]
+      properties:
+        status: { type: string, enum: [received] }
+        mediaId: { type: string }
+
+    UploadKind:
+      type: string
+      enum: [media, thumbnail]
+      description: media = a new item's original; thumbnail = a replacement thumbnail image for an existing item.
+
+    # ------------------------------------------------------ media results ---
+    MediaType:
+      type: string
+      enum: [video, short, photo, gif]
+
+    MediaProbe:
+      type: object
+      properties:
+        duration: { type: number, format: double, nullable: true }
+        width: { type: integer, nullable: true }
+        height: { type: integer, nullable: true }
+        fps: { type: number, format: double, nullable: true }
+        videoCodec: { type: string, nullable: true, maxLength: 64 }
+        audioCodec: { type: string, nullable: true, maxLength: 64 }
+        bitrate: { type: integer, nullable: true }
+        container: { type: string, nullable: true, maxLength: 255 }
+
+    NsfwResult:
+      type: object
+      required: [status, maxScore, frameCount, detectedFrameIndex, detectedTimestamp, model, modelVersion, threshold]
+      properties:
+        status: { type: string, enum: [safe, nsfw] }
+        maxScore: { type: number, format: double, minimum: 0, maximum: 1 }
+        frameCount: { type: integer, minimum: 0 }
+        detectedFrameIndex: { type: integer, nullable: true }
+        detectedTimestamp: { type: number, format: double, nullable: true }
+        model: { type: string, maxLength: 100 }
+        modelVersion: { type: string, maxLength: 100 }
+        threshold: { type: number, format: double }
+
+    HlsRendition:
+      type: object
+      required: [height, width, frameHeight, videoBitrate, audioBitrate]
+      properties:
+        height: { type: integer }
+        width: { type: integer }
+        frameHeight: { type: integer }
+        videoBitrate: { type: integer }
+        audioBitrate: { type: integer }
+
+    HlsResult:
+      type: object
+      required: [encoder, renditions, profile, preview]
+      properties:
+        encoder: { type: string, maxLength: 100 }
+        profile: { type: string, maxLength: 200, description: "The quality ladder the package was built with, e.g. \"1080,720,480,360\"." }
+        renditions:
+          type: array
+          maxItems: 16
+          items: { $ref: "#/components/schemas/HlsRendition" }
+        preview: { type: boolean, description: "Whether a hover-preview clip exists." }
+
+    SonicResult:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [done, no_audio, silent, short, error] }
+        peakDb: { type: number, format: double, nullable: true }
+        graph: { type: string, nullable: true, maxLength: 266668, description: "Base64 of one byte (0..255) per second." }
+
+    ProcessingStage:
+      type: string
+      enum: [received, probe, thumbnail, nsfw_scan, hls_transcode, sonic_graph, done]
+
+    # ======================================================== WebSocket =====
+    WsMessage:
+      type: object
+      description: |
+        Every text frame on the control channel. A request has `id` + `type`
+        (+ `payload`). Its reply has a fresh `id`, `type: "reply"`, `replyTo`
+        set to the request id, and either `ok: true` + `payload` or
+        `ok: false` + `error`. Requests the peer does not understand are
+        answered with error code `UNKNOWN_TYPE` and otherwise ignored, so an
+        older peer survives a newer one adding message types.
+      required: [id, type]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 64 }
+        type: { type: string, minLength: 1, maxLength: 64 }
+        replyTo: { type: string, maxLength: 64 }
+        ok: { type: boolean }
+        payload: { type: object, additionalProperties: true }
+        error: { $ref: "#/components/schemas/WsError" }
+
+    WsError:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, maxLength: 64 }
+        message: { type: string, maxLength: 2000 }
+
+    ProxyBinaryFrame:
+      type: object
+      description: |
+        Documentation only. A binary frame is: 1 byte kind (1 = body data,
+        2 = end of body, 3 = abort), 16 ASCII bytes of stream id, then the
+        data (kind 1 only). Used in both directions for proxied requests.
+      properties:
+        kind: { type: integer, enum: [1, 2, 3] }
+        streamId: { type: string, minLength: 16, maxLength: 16 }
+
+    Empty:
+      type: object
+      additionalProperties: false
+
+    # ---- connector -> server -------------------------------------------------
+    StorageStats:
+      type: object
+      required: [totalBytes, freeBytes, usedByMediaBytes]
+      properties:
+        totalBytes: { type: integer }
+        freeBytes: { type: integer }
+        usedByMediaBytes: { type: integer }
+
+    JobStats:
+      type: object
+      description: Media items by processing state, counted on the connector.
+      required: [queued, active, failed]
+      properties:
+        queued: { type: integer, description: "Received and waiting for a processing slot (including waiting for the NSFW scanner)." }
+        active: { type: integer, description: "Being worked on right now." }
+        failed: { type: integer, description: "Processing failed." }
+
+    CertificateInfo:
+      type: object
+      required: [domain, notAfter]
+      properties:
+        domain: { type: string, maxLength: 255 }
+        notAfter: { $ref: "#/components/schemas/Timestamp" }
+
+    HelloPayload:
+      type: object
+      required: [version, protocolVersion, os, arch, hostname, startedAt, certificate, settingsRevision, storage, jobs]
+      properties:
+        version: { type: string, maxLength: 64 }
+        protocolVersion: { type: integer }
+        os: { type: string, maxLength: 32 }
+        arch: { type: string, maxLength: 32 }
+        hostname: { type: string, maxLength: 255 }
+        startedAt: { $ref: "#/components/schemas/Timestamp" }
+        certificate:
+          allOf: [{ $ref: "#/components/schemas/CertificateInfo" }]
+          nullable: true
+        settingsRevision: { type: integer, description: "Revision of the settings the connector currently runs; 0 = defaults." }
+        storage: { $ref: "#/components/schemas/StorageStats" }
+        jobs: { $ref: "#/components/schemas/JobStats" }
+        publicAddress:
+          type: string
+          nullable: true
+          maxLength: 45
+          description: The connector's public IP as it detected it; null while unknown. Always reported, also when NetworkSettings.publicAddress overrides it.
+
+    HelloAck:
+      type: object
+      required: [connectorId, name, domain, settings, settingsRevision, heartbeatSeconds, tls, latestVersion, serverTime]
+      properties:
+        connectorId: { $ref: "#/components/schemas/ConnectorId" }
+        name: { type: string }
+        domain: { type: string }
+        settings: { $ref: "#/components/schemas/ConnectorSettings" }
+        settingsRevision: { type: integer }
+        heartbeatSeconds: { type: integer }
+        tls:
+          type: string
+          enum: [acme, none]
+          description: acme = request a certificate with cert.request when missing or expiring. none = development mode, serve plain HTTP.
+        latestVersion: { type: string, nullable: true, description: "Current version on this connector's update channel (beta follows the newer of beta and stable)." }
+        serverTime: { $ref: "#/components/schemas/Timestamp" }
+        playbackPublicKey: { type: string, description: "Current playback-token key. A change replaces the pinned key." }
+
+    HeartbeatPayload:
+      type: object
+      required: [uptimeSeconds, storage, jobs]
+      properties:
+        uptimeSeconds: { type: integer }
+        storage: { $ref: "#/components/schemas/StorageStats" }
+        jobs: { $ref: "#/components/schemas/JobStats" }
+        publicAddress:
+          type: string
+          nullable: true
+          maxLength: 45
+          description: As in HelloPayload; Jeevo updates the connector's DNS record when it changes.
+
+    HeartbeatAck:
+      type: object
+      required: [serverTime]
+      properties:
+        serverTime: { $ref: "#/components/schemas/Timestamp" }
+
+    CertRequestPayload:
+      type: object
+      required: [csrPem]
+      properties:
+        csrPem: { type: string, maxLength: 16384, description: "PEM PKCS#10 CSR for exactly the assigned domain. The private key never leaves the connector." }
+
+    CertIssued:
+      type: object
+      required: [certificatePem, notAfter]
+      properties:
+        certificatePem: { type: string, description: "Leaf + intermediates, PEM." }
+        notAfter: { $ref: "#/components/schemas/Timestamp" }
+
+    UploadReceivedPayload:
+      type: object
+      required: [uploadId, mediaId, kind, bytes, sha256]
+      properties:
+        uploadId: { type: string, maxLength: 64 }
+        mediaId: { type: string, maxLength: 64 }
+        kind: { $ref: "#/components/schemas/UploadKind" }
+        bytes: { type: integer }
+        sha256: { type: string, maxLength: 64 }
+
+    MediaProbedPayload:
+      type: object
+      required: [mediaId, type, fileSize, probe]
+      properties:
+        mediaId: { type: string, maxLength: 64 }
+        type: { $ref: "#/components/schemas/MediaType" }
+        fileSize: { type: integer }
+        probe: { $ref: "#/components/schemas/MediaProbe" }
+
+    MediaProgressPayload:
+      type: object
+      required: [mediaId, stage, progress]
+      properties:
+        mediaId: { type: string, maxLength: 64 }
+        stage: { $ref: "#/components/schemas/ProcessingStage" }
+        progress: { type: number, format: double, minimum: 0, maximum: 1, description: "Overall 0..1 across all stages. Never moves backwards." }
+        processedFrames: { type: integer, nullable: true }
+        totalFrames: { type: integer, nullable: true }
+
+    MediaProcessedPayload:
+      type: object
+      required: [mediaId, type, thumbAt, nsfw]
+      properties:
+        mediaId: { type: string, maxLength: 64 }
+        type: { $ref: "#/components/schemas/MediaType" }
+        thumbAt: { type: number, format: double }
+        nsfw: { $ref: "#/components/schemas/NsfwResult" }
+        hls:
+          allOf: [{ $ref: "#/components/schemas/HlsResult" }]
+          nullable: true
+        sonic:
+          allOf: [{ $ref: "#/components/schemas/SonicResult" }]
+          nullable: true
+
+    MediaFailedPayload:
+      type: object
+      required: [mediaId, stage, reason]
+      properties:
+        mediaId: { type: string, maxLength: 64 }
+        stage: { $ref: "#/components/schemas/ProcessingStage" }
+        reason: { type: string, maxLength: 2000, description: "For operators. Never shown to uploaders or viewers." }
+
+    MediaThumbnailUpdatedPayload:
+      type: object
+      required: [mediaId, thumbAt]
+      properties:
+        mediaId: { type: string, maxLength: 64 }
+        thumbAt: { type: number, format: double }
+
+    MediaHlsUpdatedPayload:
+      type: object
+      required: [mediaId, hls]
+      properties:
+        mediaId: { type: string, maxLength: 64 }
+        hls: { $ref: "#/components/schemas/HlsResult" }
+
+    UpdateStatusPayload:
+      type: object
+      required: [state, version]
+      properties:
+        state: { type: string, enum: [downloading, verifying, installing, restarting, failed, rolled_back] }
+        version: { type: string, maxLength: 64 }
+        error: { type: string, nullable: true, maxLength: 2000 }
+
+    ProxyResponsePayload:
+      type: object
+      required: [streamId, status, headers]
+      properties:
+        streamId: { type: string, minLength: 16, maxLength: 16 }
+        status: { type: integer }
+        headers:
+          type: object
+          maxProperties: 100
+          additionalProperties: { type: string, maxLength: 8192 }
+
+    # ---- server -> connector -------------------------------------------------
+    UploadExpectPayload:
+      type: object
+      required: [uploadId, mediaId, kind, tokenSha256, ext, declaredSize, expiresAt]
+      properties:
+        uploadId: { type: string }
+        mediaId: { type: string }
+        kind: { $ref: "#/components/schemas/UploadKind" }
+        tokenSha256: { type: string, pattern: "^[a-f0-9]{64}$", description: "The connector never sees the raw token until the uploader presents it." }
+        ext: { type: string, pattern: "^\\.[a-z0-9]{1,5}$" }
+        declaredSize: { type: integer, minimum: 1 }
+        expiresAt: { $ref: "#/components/schemas/Timestamp" }
+        thumbnailAt: { type: number, format: double, nullable: true, description: "Creator-chosen thumbnail frame (seconds)." }
+
+    UploadExpectAck:
+      type: object
+      required: [path, chunkSize]
+      properties:
+        path: { type: string, description: "Path on the connector, e.g. /v1/uploads/{uploadId}" }
+        chunkSize: { type: integer }
+
+    UploadCancelPayload:
+      type: object
+      required: [uploadId]
+      properties:
+        uploadId: { type: string }
+
+    MediaDeletePayload:
+      type: object
+      required: [mediaIds]
+      properties:
+        mediaIds: { type: array, items: { type: string }, maxItems: 1000 }
+
+    MediaThumbnailSetPayload:
+      type: object
+      required: [mediaId, at]
+      properties:
+        mediaId: { type: string }
+        at: { type: number, format: double, minimum: 0 }
+
+    SettingsApplyPayload:
+      type: object
+      required: [settings, revision]
+      properties:
+        settings: { $ref: "#/components/schemas/ConnectorSettings" }
+        revision: { type: integer }
+
+    SettingsApplyAck:
+      type: object
+      required: [applied, restartRequired]
+      properties:
+        applied: { type: boolean }
+        restartRequired: { type: boolean }
+
+    ReachPreparePayload:
+      type: object
+      required: [nonce, expiresAt]
+      properties:
+        nonce: { type: string }
+        expiresAt: { $ref: "#/components/schemas/Timestamp" }
+
+    CertRenewPayload:
+      type: object
+      properties:
+        reason: { type: string }
+
+    UpdateApplyPayload:
+      type: object
+      required: [manifest, signature]
+      properties:
+        manifest: { type: string, description: "Signed manifest JSON (see ReleaseEnvelope)." }
+        signature: { type: string }
+
+    ProxyRequestPayload:
+      type: object
+      required: [streamId, method, path, headers, hasBody]
+      properties:
+        streamId: { type: string, minLength: 16, maxLength: 16 }
+        method: { type: string, enum: [GET, HEAD, PUT, OPTIONS] }
+        path: { type: string, description: "Path and query on the connector, e.g. /v1/media/m_x/hls/master.m3u8?t=..." }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+        hasBody: { type: boolean }
+
+    ProxyCancelPayload:
+      type: object
+      required: [streamId]
+      properties:
+        streamId: { type: string }
+
+    RevokedPayload:
+      type: object
+      properties:
+        reason: { type: string }
+
+x-jeevo-ws-messages:
+  # direction: c2s = connector -> server, s2c = server -> connector.
+  # outbox: true = the connector persists it and resends until the server acks,
+  # so the server handler must be idempotent.
+  hello:                  { direction: c2s, payload: HelloPayload, reply: HelloAck }
+  heartbeat:              { direction: c2s, payload: HeartbeatPayload, reply: HeartbeatAck }
+  cert.request:           { direction: c2s, payload: CertRequestPayload, reply: CertIssued }
+  upload.received:        { direction: c2s, payload: UploadReceivedPayload, reply: Empty, outbox: true }
+  media.probed:           { direction: c2s, payload: MediaProbedPayload, reply: Empty, outbox: true }
+  media.progress:         { direction: c2s, payload: MediaProgressPayload, reply: Empty }
+  media.processed:        { direction: c2s, payload: MediaProcessedPayload, reply: Empty, outbox: true }
+  media.failed:           { direction: c2s, payload: MediaFailedPayload, reply: Empty, outbox: true }
+  media.thumbnail.updated: { direction: c2s, payload: MediaThumbnailUpdatedPayload, reply: Empty, outbox: true }
+  media.hls.updated:      { direction: c2s, payload: MediaHlsUpdatedPayload, reply: Empty, outbox: true }
+  update.status:          { direction: c2s, payload: UpdateStatusPayload, reply: Empty }
+  proxy.response:         { direction: c2s, payload: ProxyResponsePayload }
+  upload.expect:          { direction: s2c, payload: UploadExpectPayload, reply: UploadExpectAck }
+  upload.cancel:          { direction: s2c, payload: UploadCancelPayload, reply: Empty }
+  media.delete:           { direction: s2c, payload: MediaDeletePayload, reply: Empty }
+  media.thumbnail.set:    { direction: s2c, payload: MediaThumbnailSetPayload, reply: Empty }
+  settings.apply:         { direction: s2c, payload: SettingsApplyPayload, reply: SettingsApplyAck }
+  reach.prepare:          { direction: s2c, payload: ReachPreparePayload, reply: Empty }
+  cert.renew:             { direction: s2c, payload: CertRenewPayload, reply: Empty }
+  update.apply:           { direction: s2c, payload: UpdateApplyPayload, reply: Empty }
+  proxy.request:          { direction: s2c, payload: ProxyRequestPayload }
+  proxy.cancel:           { direction: s2c, payload: ProxyCancelPayload }
+  connector.revoked:      { direction: s2c, payload: RevokedPayload }
