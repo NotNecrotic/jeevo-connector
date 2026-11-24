@@ -16,8 +16,8 @@ jobs:
     name: govulncheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -30,8 +30,8 @@ jobs:
       matrix:
         flavour: [cpu, gpu]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install pip-audit
@@ -49,16 +49,16 @@ jobs:
       matrix:
         language: [go, python]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - if: matrix.language == 'go'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.language == 'go' && 'autobuild' || 'none' }}
           queries: security-and-quality
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: /language:${{ matrix.language }}
