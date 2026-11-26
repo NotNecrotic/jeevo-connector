@@ -289,8 +289,8 @@ func TestCheckUpload(t *testing.T) {
 func TestRunLimits(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	// One file bigger than MaxFileBytes is cut off by the kernel (SIGXFSZ).
-	_, err := Run(ctx, "/bin/sh", []string{"-c", "head -c 3000000 /dev/zero > big"}, RunOpts{Dir: dir, MaxFileBytes: 1 << 20})
+	// One file bigger than MaxFileBytes is cut off by the kernel (SIGXFSZ); the sleep lets Run apply the limit after start.
+	_, err := Run(ctx, "/bin/sh", []string{"-c", "sleep 0.2; head -c 3000000 /dev/zero > big"}, RunOpts{Dir: dir, MaxFileBytes: 1 << 20})
 	if err == nil {
 		t.Fatal("oversized file was written")
 	}
